@@ -1,0 +1,31 @@
+# Build output
+target/
+*.class
+
+#paytm work
+paytm work/
+
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env overrides
+.env
+.env.local
+
+# Leftover probe dir from environment checks
+.mvn-probe/
+
+# Internal grading rubric — marked "do NOT forward to the candidate" in the
+# document itself. Kept locally for reference; must never land in a repo
+# that gets submitted/pushed publicly.
+01-wallet-transfer-RUBRIC.md

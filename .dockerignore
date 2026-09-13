@@ -1,0 +1,10 @@
+target/
+.git/
+.idea/
+*.iml
+.mvn-probe/
+*.md
+!README.md
+scripts/
+.env
+.env.*

@@ -1,0 +1,30 @@
+# This file shadows src/main/resources/application.yml on the test classpath
+# (Maven puts test-classes ahead of classes), so it's a full copy plus a
+# widened Hikari pool — the concurrency tests deliberately hammer far more
+# than the default pool size of 10 to get genuine lock contention rather
+# than being bottlenecked on connection acquisition.
+spring:
+  application:
+    name: wallet-service
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+
+management:
+  endpoints:
+    web:
+      base-path: /
+      exposure:
+        include: health,prometheus
+      path-mapping:
+        prometheus: metrics
+  endpoint:
+    health:
+      show-details: always
+  prometheus:
+    metrics:
+      export:
+        enabled: true
