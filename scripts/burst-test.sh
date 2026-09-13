@@ -178,7 +178,7 @@ else
     S2_KEY="burst-key-$(date +%s)-$$-$RANDOM"
     S2_AMOUNT=2500
     S2_N=20
-    S2_BODY="{\"from\":$S2_WALLET_A,\"to\":$S2_WALLET_B,\"amountPaise\":$S2_AMOUNT,\"idempotencyKey\":\"$S2_KEY\"}"
+    S2_BODY="{\"from\":$S2_WALLET_A,\"to\":$S2_WALLET_B,\"amount_paise\":$S2_AMOUNT,\"idempotency_key\":\"$S2_KEY\"}"
 
     for i in $(seq 1 "$S2_N"); do
         http_post "$BASE_URL/transfers" "$S2_USER_A" "$S2_BODY" "$WORKDIR/s2_${i}.json" "$WORKDIR/s2_${i}.status" &
@@ -250,7 +250,7 @@ else
         for k in $(seq 1 "$S3_N_PER_PAIR"); do
             idx=$((idx + 1))
             key="burst-s3-$(date +%s)-$$-$RANDOM-$idx"
-            body="{\"from\":${S3_WALLETS[$from_idx]},\"to\":${S3_WALLETS[$to_idx]},\"amountPaise\":$S3_AMOUNT,\"idempotencyKey\":\"$key\"}"
+            body="{\"from\":${S3_WALLETS[$from_idx]},\"to\":${S3_WALLETS[$to_idx]},\"amount_paise\":$S3_AMOUNT,\"idempotency_key\":\"$key\"}"
             http_post "$BASE_URL/transfers" "burst-s3-caller" "$body" "$WORKDIR/s3_${idx}.json" "$WORKDIR/s3_${idx}.status" &
         done
     done

@@ -11,12 +11,19 @@ import com.paytm.wallet.service.TransferService;
 import com.paytm.wallet.service.WalletService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -39,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @Testcontainers
 @SpringBootTest
+@AutoConfigureMockMvc
 class TransferServiceIntegrationTest {
 
     @Container
@@ -51,6 +59,8 @@ class TransferServiceIntegrationTest {
     private TransferService transferService;
     @Autowired
     private JdbcClient jdbcClient;
+    @Autowired
+    private MockMvc mockMvc;
 
     private Wallet fundedWallet(long amountPaise) {
         Wallet wallet = walletService.getOrCreateWallet("user-" + UUID.randomUUID());
@@ -76,6 +86,37 @@ class TransferServiceIntegrationTest {
         assertThat(transfer.status()).isEqualTo(TransferStatus.COMPLETED);
         assertThat(balanceOf(a.id())).isEqualTo(7_000);
         assertThat(balanceOf(b.id())).isEqualTo(3_000);
+    }
+
+    /**
+     * Goes through real HTTP + Jackson deserialization (every other test in
+     * this class calls the service directly with a Java-constructed
+     * CreateTransferRequest, which never exercises wire-format mapping and
+     * is exactly how a snake_case/camelCase mismatch here slipped past the
+     * test suite once already). Uses the assignment's required wire field
+     * names (amount_paise, idempotency_key), not the Java field names.
+     */
+    @Test
+    void jsonRequestBody_acceptsAssignmentSnakeCaseFieldNames() throws Exception {
+        Wallet a = fundedWallet(10_000);
+        Wallet b = fundedWallet(0);
+        String key = "key-" + UUID.randomUUID();
+
+        String requestJson = """
+                {"from": %d, "to": %d, "amount_paise": 1500, "idempotency_key": "%s"}
+                """.formatted(a.id(), b.id(), key);
+
+        mockMvc.perform(post("/transfers")
+                        .header("Authorization", "Bearer caller")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestJson))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.amountPaise").value(1500))
+                .andExpect(jsonPath("$.idempotencyKey").value(key))
+                .andExpect(jsonPath("$.status").value("COMPLETED"));
+
+        assertThat(balanceOf(a.id())).isEqualTo(8_500);
+        assertThat(balanceOf(b.id())).isEqualTo(1_500);
     }
 
     @Test
