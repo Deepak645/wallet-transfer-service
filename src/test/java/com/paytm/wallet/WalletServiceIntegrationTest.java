@@ -1,15 +1,29 @@
 package com.paytm.wallet;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.paytm.wallet.domain.Wallet;
 import com.paytm.wallet.service.WalletService;
+import com.paytm.wallet.service.WalletServiceImpl;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -22,6 +36,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 
 /**
  * Real Postgres via Testcontainers — the race-free get-or-create mechanism
@@ -30,6 +45,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Testcontainers
 @SpringBootTest
+@AutoConfigureMockMvc
 class WalletServiceIntegrationTest {
 
     @Container
@@ -38,6 +54,20 @@ class WalletServiceIntegrationTest {
 
     @Autowired
     private WalletService walletService;
+    @Autowired
+    private MeterRegistry meterRegistry;
+    @Autowired
+    private MockMvc mockMvc;
+
+    private double counterValue(String name) {
+        Counter counter = meterRegistry.find(name).counter();
+        return counter == null ? 0.0 : counter.count();
+    }
+
+    private static boolean hasKv(ILoggingEvent event, String key, String value) {
+        String expected = key + "=" + value;
+        return Arrays.stream(event.getArgumentArray()).anyMatch(arg -> expected.equals(String.valueOf(arg)));
+    }
 
     @Test
     void sequentialSameUser_returnsSameWallet() {
@@ -88,6 +118,66 @@ class WalletServiceIntegrationTest {
             assertThat(distinctIds).hasSize(1);
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void getOrCreateWallet_incrementsCreatedCounterForNewWallet() {
+        double before = counterValue("wallets.create");
+
+        walletService.getOrCreateWallet("user-" + UUID.randomUUID());
+
+        assertThat(counterValue("wallets.create")).isEqualTo(before + 1);
+    }
+
+    /**
+     * Checking the internal Micrometer registry by name (as the test above
+     * does) isn't sufficient on its own: Prometheus/OpenMetrics treats a
+     * literal "_created" name suffix as reserved (the auto-generated
+     * counter-creation-timestamp series), so a counter registered as
+     * "wallets.created" would silently export as a bare "wallets_total"
+     * instead of "wallets_created_total" - the internal registry lookup
+     * would still find it fine, masking the problem. This test caught that
+     * exact bug live and is why the counter is named "wallets.create".
+     */
+    @Test
+    void metricsEndpoint_exposesWalletDomainCountersUnderExpectedNames() throws Exception {
+        walletService.getOrCreateWallet("user-" + UUID.randomUUID());
+
+        mockMvc.perform(get("/metrics"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(containsString("wallets_create_total")))
+                .andExpect(content().string(containsString("wallets_existing_total")));
+    }
+
+    @Test
+    void getOrCreateWallet_incrementsExistingCounterForRepeatCall() {
+        String userId = "user-" + UUID.randomUUID();
+        walletService.getOrCreateWallet(userId);
+        double before = counterValue("wallets.existing");
+
+        walletService.getOrCreateWallet(userId);
+
+        assertThat(counterValue("wallets.existing")).isEqualTo(before + 1);
+    }
+
+    @Test
+    void getOrCreateWallet_emitsDomainLogEvents() {
+        Logger logbackLogger = (Logger) LoggerFactory.getLogger(WalletServiceImpl.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logbackLogger.addAppender(appender);
+        try {
+            String userId = "user-" + UUID.randomUUID();
+            walletService.getOrCreateWallet(userId);
+            walletService.getOrCreateWallet(userId);
+
+            assertThat(appender.list).anyMatch(e ->
+                    "wallet created".equals(e.getFormattedMessage()) && hasKv(e, "event", "wallet.created"));
+            assertThat(appender.list).anyMatch(e ->
+                    "wallet existing".equals(e.getFormattedMessage()) && hasKv(e, "event", "wallet.existing"));
+        } finally {
+            logbackLogger.detachAppender(appender);
         }
     }
 }

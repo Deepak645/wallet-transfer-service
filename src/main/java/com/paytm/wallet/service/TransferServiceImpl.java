@@ -9,20 +9,30 @@ import com.paytm.wallet.exception.IdempotencyConflictException;
 import com.paytm.wallet.exception.NotFoundException;
 import com.paytm.wallet.repository.TransferRepository;
 import com.paytm.wallet.repository.WalletRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Optional;
 
+import static net.logstash.logback.argument.StructuredArguments.kv;
+
 @Service
 public class TransferServiceImpl implements TransferService {
 
+    private static final Logger log = LoggerFactory.getLogger(TransferServiceImpl.class);
+
     private final TransferRepository transferRepository;
     private final WalletRepository walletRepository;
+    private final MeterRegistry meterRegistry;
 
-    public TransferServiceImpl(TransferRepository transferRepository, WalletRepository walletRepository) {
+    public TransferServiceImpl(TransferRepository transferRepository, WalletRepository walletRepository,
+                                MeterRegistry meterRegistry) {
         this.transferRepository = transferRepository;
         this.walletRepository = walletRepository;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -87,6 +97,15 @@ public class TransferServiceImpl implements TransferService {
                 throw new IdempotencyConflictException(
                         "idempotency_key '" + request.idempotencyKey() + "' was already used with a different request body");
             }
+            log.info("transfer idempotent replay",
+                    kv("event", "transfer.idempotent_replay"),
+                    kv("transferId", existing.id()),
+                    kv("fromWalletId", existing.fromWalletId()),
+                    kv("toWalletId", existing.toWalletId()),
+                    kv("amountPaise", existing.amountPaise()),
+                    kv("idempotencyKey", existing.idempotencyKey()),
+                    kv("status", existing.status()));
+            meterRegistry.counter("transfers.idempotent_replay").increment();
             return existing;
         }
 
@@ -97,10 +116,28 @@ public class TransferServiceImpl implements TransferService {
 
         if (source.balancePaise() < request.amountPaise()) {
             transferRepository.updateStatus(transfer.id(), TransferStatus.DECLINED);
+            log.info("transfer declined",
+                    kv("event", "transfer.declined"),
+                    kv("transferId", transfer.id()),
+                    kv("fromWalletId", request.from()),
+                    kv("toWalletId", request.to()),
+                    kv("amountPaise", request.amountPaise()),
+                    kv("idempotencyKey", request.idempotencyKey()),
+                    kv("status", TransferStatus.DECLINED));
+            meterRegistry.counter("transfers.declined").increment();
         } else {
             walletRepository.updateBalance(source.id(), source.balancePaise() - request.amountPaise());
             walletRepository.updateBalance(destination.id(), destination.balancePaise() + request.amountPaise());
             transferRepository.updateStatus(transfer.id(), TransferStatus.COMPLETED);
+            log.info("transfer completed",
+                    kv("event", "transfer.completed"),
+                    kv("transferId", transfer.id()),
+                    kv("fromWalletId", request.from()),
+                    kv("toWalletId", request.to()),
+                    kv("amountPaise", request.amountPaise()),
+                    kv("idempotencyKey", request.idempotencyKey()),
+                    kv("status", TransferStatus.COMPLETED));
+            meterRegistry.counter("transfers.completed").increment();
         }
 
         return transferRepository.findById(transfer.id())

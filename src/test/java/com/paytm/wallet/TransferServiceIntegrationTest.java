@@ -1,5 +1,8 @@
 package com.paytm.wallet;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.paytm.wallet.domain.Transfer;
 import com.paytm.wallet.domain.TransferStatus;
 import com.paytm.wallet.domain.Wallet;
@@ -8,8 +11,12 @@ import com.paytm.wallet.exception.BadRequestException;
 import com.paytm.wallet.exception.IdempotencyConflictException;
 import com.paytm.wallet.exception.NotFoundException;
 import com.paytm.wallet.service.TransferService;
+import com.paytm.wallet.service.TransferServiceImpl;
 import com.paytm.wallet.service.WalletService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,11 +28,14 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
@@ -37,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.Matchers.containsString;
 
 /**
  * Real Postgres via Testcontainers. These tests exercise the actual
@@ -61,6 +72,18 @@ class TransferServiceIntegrationTest {
     private JdbcClient jdbcClient;
     @Autowired
     private MockMvc mockMvc;
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    private double counterValue(String name) {
+        Counter counter = meterRegistry.find(name).counter();
+        return counter == null ? 0.0 : counter.count();
+    }
+
+    private static boolean hasKv(ILoggingEvent event, String key, String value) {
+        String expected = key + "=" + value;
+        return Arrays.stream(event.getArgumentArray()).anyMatch(arg -> expected.equals(String.valueOf(arg)));
+    }
 
     private Wallet fundedWallet(long amountPaise) {
         Wallet wallet = walletService.getOrCreateWallet("user-" + UUID.randomUUID());
@@ -274,5 +297,86 @@ class TransferServiceIntegrationTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void completedTransfer_incrementsCompletedCounter() {
+        Wallet a = fundedWallet(10_000);
+        Wallet b = fundedWallet(0);
+        double before = counterValue("transfers.completed");
+
+        transferService.createTransfer("caller",
+                new CreateTransferRequest(a.id(), b.id(), 1_000, "key-" + UUID.randomUUID()));
+
+        assertThat(counterValue("transfers.completed")).isEqualTo(before + 1);
+    }
+
+    @Test
+    void declinedTransfer_incrementsDeclinedCounter() {
+        Wallet a = fundedWallet(100);
+        Wallet b = fundedWallet(0);
+        double before = counterValue("transfers.declined");
+
+        transferService.createTransfer("caller",
+                new CreateTransferRequest(a.id(), b.id(), 500, "key-" + UUID.randomUUID()));
+
+        assertThat(counterValue("transfers.declined")).isEqualTo(before + 1);
+    }
+
+    @Test
+    void idempotentReplay_incrementsReplayCounter() {
+        Wallet a = fundedWallet(1_000);
+        Wallet b = fundedWallet(0);
+        CreateTransferRequest request = new CreateTransferRequest(a.id(), b.id(), 200, "key-" + UUID.randomUUID());
+
+        transferService.createTransfer("caller", request); // original - claims the key, no replay counter yet
+        double before = counterValue("transfers.idempotent_replay");
+
+        transferService.createTransfer("caller", request); // replay
+
+        assertThat(counterValue("transfers.idempotent_replay")).isEqualTo(before + 1);
+    }
+
+    @Test
+    void createTransfer_emitsDomainLogEvents() {
+        Logger logbackLogger = (Logger) LoggerFactory.getLogger(TransferServiceImpl.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logbackLogger.addAppender(appender);
+        try {
+            Wallet a = fundedWallet(10_000);
+            Wallet b = fundedWallet(0);
+            CreateTransferRequest completedReq =
+                    new CreateTransferRequest(a.id(), b.id(), 1_000, "key-" + UUID.randomUUID());
+            transferService.createTransfer("caller", completedReq); // completed
+            transferService.createTransfer("caller", completedReq); // idempotent replay
+
+            Wallet c = fundedWallet(50);
+            transferService.createTransfer("caller",
+                    new CreateTransferRequest(c.id(), b.id(), 500, "key-" + UUID.randomUUID())); // declined
+
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer completed".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.completed"));
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer idempotent replay".equals(e.getFormattedMessage())
+                            && hasKv(e, "event", "transfer.idempotent_replay"));
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer declined".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.declined"));
+        } finally {
+            logbackLogger.detachAppender(appender);
+        }
+    }
+
+    @Test
+    void metricsEndpoint_exposesHistogramBucketsForHttpServerRequests() throws Exception {
+        Wallet a = fundedWallet(0);
+        // At least one HTTP request must have gone through the timed filter
+        // chain before its histogram buckets exist to scrape.
+        mockMvc.perform(get("/wallets/" + a.id()).header("Authorization", "Bearer probe"))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/metrics"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(containsString("http_server_requests_seconds_bucket")));
     }
 }
