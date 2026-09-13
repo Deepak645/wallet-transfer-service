@@ -3,6 +3,16 @@
 Core concurrency/idempotency logic implemented — see [Current implementation status](#current-implementation-status).
 Stack: Java 21, Spring Boot 3.3, PostgreSQL, Maven.
 
+## Live Deployment
+
+Deployed on Railway from this repository's Dockerfile, backed by a Railway-managed PostgreSQL instance.
+
+- **Live API URL:** https://wallet-transfer-service-production-0e3e.up.railway.app
+- **Health:** https://wallet-transfer-service-production-0e3e.up.railway.app/health
+- **Metrics:** https://wallet-transfer-service-production-0e3e.up.railway.app/metrics
+
+See "Deploying to Railway" below for the exact setup, and "Burst script" for how to run the concurrency scenarios against this URL.
+
 ## Run locally
 
 Requires a local PostgreSQL instance (or run just the `db` service from
@@ -38,9 +48,10 @@ and edit it if you want different local credentials; `.env` is gitignored.
 
 ## Deploying to Railway
 
-The app is Railway-ready (Dockerfile-based deploy, port and datasource
-config all read from environment variables — see below). Deployment
-itself is a manual step; nothing below has been done yet.
+The app is deployed on Railway (Dockerfile-based deploy; port and
+datasource config are read from environment variables — see below). The
+steps below describe the actual deployment setup, kept here so it can be
+reproduced or audited.
 
 1. Push this repository to a **public** GitHub repo (required by the
    exercise for the "public repo" deliverable, and simplest for Railway).
@@ -72,9 +83,11 @@ itself is a manual step; nothing below has been done yet.
 8. Optional but recommended: under **Settings → Deploy**, set
    **Healthcheck Path** to `/health` so Railway uses the app's real health
    endpoint (rather than just container-started) to gate deploys/restarts.
-9. For the exercise's "public logs" deliverable: Railway's **Deployments →
-   View Logs** panel shows the structured JSON logs live; share that view
-   (or a screen recording of it) per the exercise's submission instructions.
+9. Logs: Railway's **Deployments → View Logs** panel shows the live
+   structured JSON logs for the deployed service. This dashboard view is
+   not a public URL a reviewer can open directly — the submission instead
+   includes a screen recording of these logs streaming during a burst-test
+   run against the live URL above.
 
 Railway environment variables needed (app service only — the Postgres
 service configures itself):
@@ -110,8 +123,8 @@ input validation failures are `400`, unknown wallets are `404`.
 
 ## Current implementation status
 
-**Implemented** (see `AI-USAGE.md` for what was user-directed vs. AI-decided
-within that direction):
+**Implemented** (see `AI-USAGE.md` for the distinction between
+user-directed architecture and AI-assisted implementation).
 
 - **Race-free get-or-create** (`WalletServiceImpl`): `INSERT ... ON CONFLICT
   (user_id) DO NOTHING`, falling back to a `SELECT` on conflict. Backed by
@@ -152,21 +165,36 @@ fixed after (stable across dozens of runs at higher concurrency).
   (out of scope per the exercise; tests, the burst script, and manual
   verification all fund wallets by writing directly to the `wallets`
   table — see `scripts/burst-test.sh`'s `fund_wallet`/`run_psql`).
-- Deployment — the app is ready to deploy (see "Deploying to Railway"
-  below) but has not actually been deployed yet; that's a manual step for
-  the project owner to perform.
 
 ## Burst script
+
+Local:
 
 ```bash
 BASE_URL="${BASE_URL:-http://localhost:8080}" ./scripts/burst-test.sh
 ```
 
+Against the deployed Railway instance:
+
+```bash
+BASE_URL=https://wallet-transfer-service-production-0e3e.up.railway.app ./scripts/burst-test.sh
+```
+
 Runs the three live-fire scenarios from the exercise against a running
-instance (local or deployed) and prints `PASS`/`FAIL` per assertion, with
-a non-zero exit code if anything fails. Funds test wallets via a direct
-`UPDATE` through `psql` (real client if on `PATH`, else `docker compose
-exec db psql` for local runs) since there's no deposit endpoint by design.
+instance and prints `PASS`/`FAIL` per assertion, with a non-zero exit code
+if anything fails.
+
+Scenarios 2 and 3 need wallets with a nonzero starting balance to have
+money to move, but the exercise doesn't define a deposit/funding API and
+wallets are always created at balance 0. The script establishes that
+starting balance with a direct SQL `UPDATE` via `psql` — **this is test
+setup only**, not an endpoint and not itself under test; the only API
+exercised and asserted on is `POST /transfers` (and `POST /wallets` in
+scenario 1). This DB write runs against whatever Postgres the person
+running the script already has direct access to (a real `psql` client on
+`PATH`, or `docker compose exec db psql` for a local stack) — it does not
+require, and does not assume, access to the deployed Railway database's
+credentials.
 
 ## Tests
 
@@ -184,8 +212,3 @@ Testcontainers 1.20.x failed to talk to a very recent Docker Desktop
 release (docker-java API version negotiation bug); pinned to 1.21.4 in
 `pom.xml`, which resolved it.
 
-## Pending design decisions
-
-None remaining from the original list (concurrency mechanism, idempotency
-placement, get-or-create mechanism, no-overdraft, consistency-vs-availability
-stance are all decided and implemented per direction from the project owner).

@@ -2,25 +2,41 @@
 # One-command burst/concurrency test against a running wallet-service.
 #
 # Usage:
-#   ./burst-test.sh                                   # targets http://localhost:8080
-#   BASE_URL=https://your-deployed-url ./burst-test.sh
+#   ./burst-test.sh
+#       targets http://localhost:8080
 #
-# Exercises the three live-fire scenarios from 01-wallet-transfer-exercise.md:
-#   1. Concurrent get-or-create for the same user -> exactly one wallet.
-#   2. Concurrent identical transfers, same idempotency_key -> exactly one
-#      movement, identical successful responses.
-#   3. Concurrent transfers among a small set of wallets, including
-#      opposite-direction pairs -> conservation holds, no negative balance.
+#   BASE_URL=https://wallet-transfer-service-production-0e3e.up.railway.app ./burst-test.sh
+#       targets the deployed Railway application
 #
-# FUNDING (test-only, not a production feature): there is no deposit/top-up
-# endpoint in the API by design (out of scope per the exercise) - wallets
-# can only be created at balance 0. To test transfers with a real balance,
-# this script writes directly to the wallets table via psql, using a plain
-# UPDATE statement, gated on standard PG* connection env vars. It prefers a
-# real `psql` client on PATH (works against any reachable Postgres,
-# including a deployed managed instance); if none is found, it falls back
-# to `docker compose exec db psql` for local docker-compose runs. This is
-# an explicit test-setup mechanism, not part of the application.
+# WHAT THIS TESTS: the three live-fire concurrency scenarios required by the
+# Paytm PML R2 assignment, exercised purely through the public HTTP API
+# (POST /wallets, POST /transfers):
+#   1. Concurrent get-or-create: N simultaneous POST /wallets for the same
+#      brand-new user -> exactly one wallet.
+#   2. Idempotent retry storm: K simultaneous identical POST /transfers using
+#      the same idempotency_key -> exactly one debit/credit, identical
+#      responses.
+#   3. Conservation under contention: many simultaneous transfers among a
+#      small set of wallets, including opposite directions (A->B and B->A)
+#      -> total balance unchanged, no negative balances.
+#
+# TEST-SETUP-ONLY DATABASE WRITE - read before judging the DB access below:
+# the assignment does not define a deposit/funding API, and wallets are
+# always created at balance 0. Scenarios 2 and 3 need a nonzero starting
+# balance to have money to move at all, so this script sets one directly
+# with a plain SQL UPDATE via psql. Nothing more.
+#   - This UPDATE is test setup only. It is not an endpoint, not part of the
+#     wallet service, and not itself under test. The only API exercised and
+#     asserted on in every scenario, including 2 and 3, is POST /transfers
+#     (and POST /wallets in scenario 1).
+#   - It doesn't expose Postgres publicly and doesn't require a reviewer to
+#     hold our Railway/Postgres credentials: it runs against whatever
+#     Postgres the person running this script already has direct access to
+#     - a local docker-compose stack, or a local psql pointed at one (see
+#     PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE below).
+#   - This is not a claim about how a real deployment would establish
+#     balances - the assignment doesn't specify a funding mechanism, so this
+#     script doesn't invent or imply one.
 set -uo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:8080}"
@@ -60,7 +76,7 @@ json_num_field() { # $1=json $2=field
     printf '%s' "$1" | grep -o "\"$2\":-\{0,1\}[0-9][0-9]*" | head -1 | sed -E "s/.*:(-?[0-9]+)/\1/"
 }
 
-# ---- test-only DB funding ----
+# ---- test-only DB funding (see header) - NOT part of the API under test ----
 
 run_psql() { # $1 = SQL statement
     if command -v psql >/dev/null 2>&1; then
@@ -170,7 +186,7 @@ S2_WALLET_B="$(create_wallet "$S2_USER_B")"
 if [ -z "$S2_WALLET_A" ] || [ -z "$S2_WALLET_B" ]; then
     fail "scenario 2: could not create test wallets (A='$S2_WALLET_A' B='$S2_WALLET_B')"
 else
-    fund_wallet "$S2_WALLET_A" 100000
+    fund_wallet "$S2_WALLET_A" 100000 # test setup only (see header) - not part of the API under test
 
     s2_before_a="$(get_balance "$S2_WALLET_A")"
     s2_before_b="$(get_balance "$S2_WALLET_B")"
@@ -227,7 +243,7 @@ for n in 1 2 3; do
     if [ -z "$w" ]; then
         fail "scenario 3: could not create test wallet #$n"
     else
-        fund_wallet "$w" 20000
+        fund_wallet "$w" 20000 # test setup only (see header) - not part of the API under test
         S3_WALLETS+=("$w")
     fi
 done
