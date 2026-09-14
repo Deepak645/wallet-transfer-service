@@ -12,55 +12,56 @@ import org.springframework.http.MediaType;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
-import java.util.List;
-import java.util.Set;
 
 /**
- * Minimal bearer-token auth: the token value itself IS the caller's user id.
- * There is no user directory / token registry in this exercise (auth
- * sophistication is explicitly not graded) — this only identifies the
- * caller for the purposes of get-or-create and transfer authorization,
- * both of which are still pending design decisions.
+ * Guards the TEST-ONLY funding endpoint
+ * ({@code com.paytm.wallet.controller.TestFundingController}). Only
+ * registered at all when {@code test.funding.enabled=true} (see
+ * {@code FilterConfig}), and mapped only to {@code /test/*} - it has no
+ * effect on any other endpoint's authentication.
+ *
+ * Requires {@code Authorization: Bearer <the configured TEST_FUNDING_TOKEN>}
+ * exactly; missing, malformed, or wrong values are all rejected the same
+ * way (401). The token is compared in constant time and is never logged,
+ * including in error responses.
  */
-public class BearerAuthFilter extends OncePerRequestFilter {
+public class TestFundingAuthFilter extends OncePerRequestFilter {
 
     private static final String BEARER_PREFIX = "Bearer ";
-    private static final Set<String> EXCLUDED_PREFIXES = Set.of("/health", "/metrics", "/actuator", "/test");
 
+    private final String expectedToken;
     private final ObjectMapper objectMapper;
 
-    public BearerAuthFilter(ObjectMapper objectMapper) {
+    public TestFundingAuthFilter(String expectedToken, ObjectMapper objectMapper) {
+        this.expectedToken = expectedToken;
         this.objectMapper = objectMapper;
-    }
-
-    @Override
-    protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getRequestURI();
-        return EXCLUDED_PREFIXES.stream().anyMatch(path::startsWith);
     }
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
-        String authHeader = request.getHeader("Authorization");
-        if (authHeader == null || !authHeader.startsWith(BEARER_PREFIX) || authHeader.length() <= BEARER_PREFIX.length()) {
+        String header = request.getHeader("Authorization");
+        String provided = (header != null && header.startsWith(BEARER_PREFIX))
+                ? header.substring(BEARER_PREFIX.length()).trim()
+                : "";
+
+        if (!isValidToken(provided)) {
             writeUnauthorized(request, response);
             return;
         }
+        filterChain.doFilter(request, response);
+    }
 
-        String token = authHeader.substring(BEARER_PREFIX.length()).trim();
-        if (token.isEmpty()) {
-            writeUnauthorized(request, response);
-            return;
+    private boolean isValidToken(String provided) {
+        if (provided.isEmpty() || expectedToken.isEmpty()) {
+            return false;
         }
-
-        CallerContext.set(token);
-        try {
-            filterChain.doFilter(request, response);
-        } finally {
-            CallerContext.clear();
-        }
+        return MessageDigest.isEqual(
+                provided.getBytes(StandardCharsets.UTF_8),
+                expectedToken.getBytes(StandardCharsets.UTF_8));
     }
 
     private void writeUnauthorized(HttpServletRequest request, HttpServletResponse response) throws IOException {
@@ -70,7 +71,7 @@ public class BearerAuthFilter extends OncePerRequestFilter {
                 Instant.now(),
                 HttpStatus.UNAUTHORIZED.value(),
                 HttpStatus.UNAUTHORIZED.getReasonPhrase(),
-                "Missing or malformed Authorization header. Expected: Bearer <token>",
+                "Missing or invalid test funding token",
                 request.getRequestURI(),
                 MDC.get("correlationId")
         );

@@ -14,6 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Optional;
 
@@ -70,6 +72,18 @@ public class TransferServiceImpl implements TransferService {
      *    COMPLETED. Either way the transfer row is finalized and both
      *    wallet writes (if any) commit in the same transaction as
      *    everything else.
+     *
+     * Domain events/counters (transfer.created/debited/credited/declined/
+     * completed/idempotent_replay) are deliberately fired via afterCommit(),
+     * not inline: they must never claim a movement that didn't durably
+     * happen. Logging/incrementing inline (immediately after the SQL
+     * statement, before the method returns) would fire even if a later
+     * statement in this same transaction throws and the whole thing rolls
+     * back. Spring runs afterCommit() synchronously as part of the
+     * transactional proxy's commit step, before control returns to this
+     * method's caller, so callers (including tests) still observe every
+     * event by the time the call returns - it's strictly safer, not
+     * asynchronous or delayed in practice.
      */
     @Override
     @Transactional
@@ -97,47 +111,82 @@ public class TransferServiceImpl implements TransferService {
                 throw new IdempotencyConflictException(
                         "idempotency_key '" + request.idempotencyKey() + "' was already used with a different request body");
             }
-            log.info("transfer idempotent replay",
-                    kv("event", "transfer.idempotent_replay"),
-                    kv("transferId", existing.id()),
-                    kv("fromWalletId", existing.fromWalletId()),
-                    kv("toWalletId", existing.toWalletId()),
-                    kv("amountPaise", existing.amountPaise()),
-                    kv("idempotencyKey", existing.idempotencyKey()),
-                    kv("status", existing.status()));
-            meterRegistry.counter("transfers.idempotent_replay").increment();
+            afterCommit(() -> {
+                log.info("transfer idempotent replay",
+                        kv("event", "transfer.idempotent_replay"),
+                        kv("transferId", existing.id()),
+                        kv("fromWalletId", existing.fromWalletId()),
+                        kv("toWalletId", existing.toWalletId()),
+                        kv("amountPaise", existing.amountPaise()),
+                        kv("idempotencyKey", existing.idempotencyKey()),
+                        kv("status", existing.status()));
+                meterRegistry.counter("transfers.idempotent_replay").increment();
+            });
             return existing;
         }
 
         Transfer transfer = claimed.get();
+        afterCommit(() -> {
+            log.info("transfer created",
+                    kv("event", "transfer.created"),
+                    kv("transferId", transfer.id()),
+                    kv("fromWalletId", transfer.fromWalletId()),
+                    kv("toWalletId", transfer.toWalletId()),
+                    kv("amountPaise", transfer.amountPaise()),
+                    kv("idempotencyKey", transfer.idempotencyKey()),
+                    kv("status", transfer.status()));
+            // Named "transfers.create", not "transfers.created" - same
+            // Prometheus/OpenMetrics reserved-"_created"-suffix collision
+            // documented on WalletServiceImpl's "wallets.create" counter,
+            // confirmed the same way (live /metrics scrape).
+            meterRegistry.counter("transfers.create").increment();
+        });
 
         Wallet source = request.from() == lowId ? lowWallet : highWallet;
         Wallet destination = request.from() == lowId ? highWallet : lowWallet;
 
         if (source.balancePaise() < request.amountPaise()) {
             transferRepository.updateStatus(transfer.id(), TransferStatus.DECLINED);
-            log.info("transfer declined",
-                    kv("event", "transfer.declined"),
-                    kv("transferId", transfer.id()),
-                    kv("fromWalletId", request.from()),
-                    kv("toWalletId", request.to()),
-                    kv("amountPaise", request.amountPaise()),
-                    kv("idempotencyKey", request.idempotencyKey()),
-                    kv("status", TransferStatus.DECLINED));
-            meterRegistry.counter("transfers.declined").increment();
+            afterCommit(() -> {
+                log.info("transfer declined",
+                        kv("event", "transfer.declined"),
+                        kv("transferId", transfer.id()),
+                        kv("fromWalletId", request.from()),
+                        kv("toWalletId", request.to()),
+                        kv("amountPaise", request.amountPaise()),
+                        kv("idempotencyKey", request.idempotencyKey()),
+                        kv("status", TransferStatus.DECLINED));
+                meterRegistry.counter("transfers.declined_insufficient_funds").increment();
+            });
         } else {
             walletRepository.updateBalance(source.id(), source.balancePaise() - request.amountPaise());
-            walletRepository.updateBalance(destination.id(), destination.balancePaise() + request.amountPaise());
-            transferRepository.updateStatus(transfer.id(), TransferStatus.COMPLETED);
-            log.info("transfer completed",
-                    kv("event", "transfer.completed"),
+            afterCommit(() -> log.info("transfer debited",
+                    kv("event", "transfer.debited"),
                     kv("transferId", transfer.id()),
-                    kv("fromWalletId", request.from()),
-                    kv("toWalletId", request.to()),
+                    kv("fromWalletId", source.id()),
                     kv("amountPaise", request.amountPaise()),
-                    kv("idempotencyKey", request.idempotencyKey()),
-                    kv("status", TransferStatus.COMPLETED));
-            meterRegistry.counter("transfers.completed").increment();
+                    kv("idempotencyKey", request.idempotencyKey())));
+
+            walletRepository.updateBalance(destination.id(), destination.balancePaise() + request.amountPaise());
+            afterCommit(() -> log.info("transfer credited",
+                    kv("event", "transfer.credited"),
+                    kv("transferId", transfer.id()),
+                    kv("toWalletId", destination.id()),
+                    kv("amountPaise", request.amountPaise()),
+                    kv("idempotencyKey", request.idempotencyKey())));
+
+            transferRepository.updateStatus(transfer.id(), TransferStatus.COMPLETED);
+            afterCommit(() -> {
+                log.info("transfer completed",
+                        kv("event", "transfer.completed"),
+                        kv("transferId", transfer.id()),
+                        kv("fromWalletId", request.from()),
+                        kv("toWalletId", request.to()),
+                        kv("amountPaise", request.amountPaise()),
+                        kv("idempotencyKey", request.idempotencyKey()),
+                        kv("status", TransferStatus.COMPLETED));
+                meterRegistry.counter("transfers.completed").increment();
+            });
         }
 
         return transferRepository.findById(transfer.id())
@@ -148,6 +197,25 @@ public class TransferServiceImpl implements TransferService {
         return existing.fromWalletId().equals(request.from())
                 && existing.toWalletId().equals(request.to())
                 && existing.amountPaise() == request.amountPaise();
+    }
+
+    /**
+     * Runs `action` only once this method's transaction actually commits, so
+     * a domain event or counter can never fire for a movement that later
+     * rolled back. Falls back to running immediately if (unexpectedly)
+     * called outside a transaction.
+     */
+    private void afterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    action.run();
+                }
+            });
+        } else {
+            action.run();
+        }
     }
 
     @Override

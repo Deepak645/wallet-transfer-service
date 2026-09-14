@@ -2,46 +2,225 @@
 
 ## 1. Data Model
 
-Two tables (Flyway `V1__init_schema.sql`, `V2__wallet_transfer_constraints.sql`):
+Two tables are created through Flyway migrations
+(`V1__init_schema.sql` and `V2__wallet_transfer_constraints.sql`).
 
-**`wallets`**: `id` (BIGSERIAL PK), `user_id` (VARCHAR, **UNIQUE**), `balance_paise` (BIGINT, **CHECK >= 0**), `created_at`, `updated_at`.
+### `wallets`
 
-**`transfers`**: `id` (BIGSERIAL PK), `from_wallet_id` / `to_wallet_id` (BIGINT, FK → `wallets(id)`), `amount_paise` (BIGINT), `idempotency_key` (VARCHAR, **UNIQUE**), `status` (`PENDING`/`COMPLETED`/`DECLINED`), timestamps. Indexed on both wallet FKs.
+- `id` — `BIGSERIAL` primary key
+- `user_id` — `VARCHAR`, `UNIQUE`
+- `balance_paise` — `BIGINT`, `CHECK (balance_paise >= 0)`
+- `created_at`
+- `updated_at`
 
-A transfer references its wallets by foreign key only — it never caches balances. Money is **integer paise**, never floats/decimal rupees, so debit, credit, and conservation checks are exact integer arithmetic with no rounding error.
+### `transfers`
+
+- `id` — `BIGSERIAL` primary key
+- `from_wallet_id` — `BIGINT`, foreign key to `wallets(id)`
+- `to_wallet_id` — `BIGINT`, foreign key to `wallets(id)`
+- `amount_paise` — `BIGINT`
+- `idempotency_key` — `VARCHAR`, `UNIQUE`
+- `status` — `PENDING`, `COMPLETED`, or `DECLINED`
+- timestamps
+
+Indexes exist on both wallet foreign keys.
+
+A transfer references its wallets by foreign key and does not cache wallet
+balances. Money is represented as integer paise rather than floating-point or
+decimal rupee values, allowing exact integer arithmetic for debit, credit, and
+conservation.
 
 ## 2. Transfer Atomicity and Concurrency
 
-`TransferServiceImpl.createTransfer` runs as one `@Transactional` method. Both wallet rows are locked with `SELECT ... FOR UPDATE` in **ascending wallet-id order** (`Math.min`/`Math.max` of the two ids, independent of transfer direction). Only once both locks are held is the balance checked: insufficient balance declines with no write to either wallet; sufficient balance debits and credits in the same transaction before commit. There is no partial-apply path.
+`TransferServiceImpl.createTransfer` runs as one transactional operation.
 
-Deterministic ordering exists so a concurrent `A→B` and `B→A` can't deadlock: both request the same first lock (the lower id) before the second, so neither can hold-and-wait on the other in reverse order. This was verified, not assumed — an earlier version locked the idempotency-key row first, and Postgres's implicit `FOR KEY SHARE` lock on FK-referenced wallets (taken in `from`/`to` order at insert time) reintroduced the same deadlock. Locking the wallets explicitly *before* that insert closed the gap; a concurrency test reproduced the deadlock before the fix and passed after.
+The transfer flow is:
 
-Rejected alternatives: a conditional `UPDATE ... WHERE balance >= amount` (no explicit locking) was considered but not used, in favor of the more auditable two-lock approach. `SKIP LOCKED` was explicitly excluded — a contended transfer must wait, not silently no-op. `SERIALIZABLE` isolation with retry was rejected as heavier than needed. Application-level or distributed locking is unnecessary with a single authoritative Postgres. None of these alternatives are implemented.
+1. Lock both wallet rows using `SELECT ... FOR UPDATE`.
+2. Acquire the locks in ascending wallet-ID order, independent of transfer
+   direction.
+3. Check whether the source wallet has sufficient balance.
+4. If insufficient, decline the transfer without modifying either wallet.
+5. If sufficient, debit the source and credit the destination.
+6. Persist the transfer and idempotency state in the same transaction.
+7. Commit the complete operation.
+
+There is no partial-apply path: the debit, credit, and transfer state either
+commit together or roll back together.
+
+### Deadlock avoidance
+
+Deterministic lock ordering prevents the classic opposite-direction case:
+
+```text
+A -> B
+B -> A
+```
+
+Both transactions acquire the lower wallet ID first, so they cannot acquire
+the two wallet locks in opposite orders.
+
+This was verified during testing rather than assumed. An earlier implementation
+claimed the idempotency key before explicitly locking the wallets. PostgreSQL's
+foreign-key enforcement could then acquire implicit `FOR KEY SHARE` locks in
+`from_wallet_id` / `to_wallet_id` order, allowing the same opposite-direction
+deadlock to occur.
+
+The fix was to explicitly lock both wallets in ascending ID order before the
+idempotency-claim insert. The concurrency test reproduced the deadlock before
+the fix and passed repeatedly after the fix.
+
+### Alternatives considered
+
+- **Conditional `UPDATE ... WHERE balance >= amount`** — possible, but the
+  explicit two-wallet locking approach makes the concurrency behavior more
+  direct and auditable.
+- **`SKIP LOCKED`** — not appropriate because a contended money transfer must
+  wait for the required lock rather than silently skip the operation.
+- **`SERIALIZABLE` isolation with retries** — stronger than necessary for this
+  design and adds retry complexity.
+- **Application/distributed locking** — unnecessary because PostgreSQL is the
+  authoritative state store and already provides the required row-level
+  locking.
+
+These alternatives are not implemented.
 
 ## 3. Get-or-Create Wallet
 
-`POST /wallets` runs `INSERT ... ON CONFLICT (user_id) DO NOTHING RETURNING ...`, backed by `UNIQUE(user_id)`. A winning insert returns that row; a losing one is guaranteed the winner has already committed (Postgres serializes concurrent inserts on the same key), so a follow-up `SELECT` by `user_id` always finds it — no race window. Check-then-insert is race-prone because two concurrent requests can both pass the existence check before either inserts, producing two wallets for one user.
+`POST /wallets` uses:
+
+```sql
+INSERT ... ON CONFLICT (user_id) DO NOTHING RETURNING ...
+```
+
+backed by the database `UNIQUE(user_id)` constraint.
+
+If the insert succeeds, the new wallet is returned. If another concurrent
+request wins the same unique key, the losing request performs a follow-up
+`SELECT` by `user_id` after the conflicting insert has resolved.
+
+This avoids the race in a check-then-insert approach, where two concurrent
+requests could both observe that a wallet does not exist before either
+request inserts it.
+
+The database constraint is the final authority that guarantees one wallet
+per user.
 
 ## 4. Idempotency
 
-`transfers.idempotency_key` is `UNIQUE`. A request first attempts `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` (status `PENDING`) in the same transaction that later debits/credits and finalizes the status. A winning insert owns the movement. A losing one finds the existing (committed) row and compares it to the incoming request: identical body returns the original result; a different body returns `409`. Storing the idempotency claim separately from the movement would let a crash between the two commits leave a claimed key with no movement, or a movement with no claim — breaking exactly-once semantics. Sharing one transaction means concurrent identical requests produce exactly one balance movement; every other caller only reads.
+`transfers.idempotency_key` has a database `UNIQUE` constraint.
+
+A transfer request attempts to claim the idempotency key with:
+
+```sql
+INSERT ... ON CONFLICT (idempotency_key) DO NOTHING
+```
+
+The idempotency claim, wallet locking, balance movement, and final transfer
+state are part of the same database transaction.
+
+The behavior is:
+
+- **Same key + same request body** → return the original transfer result.
+- **Same key + different request body** → return `409 Conflict`.
+- **Concurrent requests with the same key** → the database uniqueness
+  constraint allows only one request to perform the balance movement.
+
+Keeping the idempotency claim in the same transaction as the wallet movement
+avoids a split-brain state where an idempotency record could be committed
+without the corresponding money movement, or vice versa.
 
 ## 5. Consistency vs Availability
 
-Correctness is prioritized over availability. There is one authoritative Postgres instance; if it's unreachable, a transfer fails outright rather than being accepted into a queue and applied later. An "available" write that isn't durably recorded is worse than an outage for a ledger — it can silently lose or duplicate money. No write-behind cache or eventual-consistency path exists.
+Correctness is prioritized over availability for monetary operations.
+
+PostgreSQL is the authoritative source of truth. If the database is
+unavailable, a transfer fails rather than being accepted into a queue and
+applied later.
+
+An accepted write that is not durably recorded could result in lost or
+duplicated money. For this system, failing the operation is preferable to
+accepting a transfer without durable state.
+
+There is no write-behind cache or eventual-consistency path for wallet
+balances or transfers.
 
 ## 6. Observability
 
-Logs are structured JSON (Logback + `logstash-logback-encoder`) with a correlation ID per request (`CorrelationIdFilter`, `X-Correlation-Id` header + MDC). Domain events are logged explicitly where they occur: `wallet.created`, `wallet.existing`, `transfer.completed`, `transfer.declined`, `transfer.idempotent_replay`, each with structured fields (ids, amounts, idempotency key, status). The same events increment Micrometer counters (`wallets.create`, `wallets.existing`, `transfers.completed`, `transfers.declined`, `transfers.idempotent_replay`), exposed alongside HTTP request-rate/latency/error metrics — with histogram buckets enabled for `http.server.requests` so p99 is computable via `histogram_quantile` — at `/metrics` in Prometheus format. `/health` reports application and database status.
+The application provides structured JSON logs, correlation IDs, domain
+events, metrics, and health information.
 
-## 7. AI Usage
+### Correlation
 
-### Directed by me
-PostgreSQL as the sole authoritative state; transactional debit+credit as one atomic unit; the locking strategy (`SELECT ... FOR UPDATE`, both wallets, deterministic ascending-id order); database-enforced uniqueness for wallet creation and idempotency; the consistency-over-availability stance.
+Each request receives a correlation ID through `CorrelationIdFilter`.
 
-### AI-assisted implementation decisions
-The Java/Spring Boot/JDBC implementation of the above; SQL statement details; validation and exception handling; Testcontainers-based integration and concurrency tests; the logging/metrics implementation; Docker/Compose/Railway deployment configuration; debugging (including diagnosing and fixing the FK-lock-ordering deadlock in Section 2); and this document. AI worked out implementation details, wrote and ran the tests, and found/fixed a real concurrency bug in the process — not merely typing a fully predetermined design.
+The ID can also be supplied through the `X-Correlation-Id` header and is
+available through MDC for structured logging.
+
+### Domain events
+
+The application records events including:
+
+- `wallet.created`
+- `wallet.existing`
+- `wallet.test_funded`
+- `transfer.created`
+- `transfer.debited`
+- `transfer.credited`
+- `transfer.completed`
+- `transfer.declined`
+- `transfer.idempotent_replay`
+
+Transaction-dependent events are emitted after the transaction commits, so
+events describing wallet or transfer state changes are not emitted for a
+transaction that subsequently rolls back.
+
+### Metrics
+
+Micrometer counters cover wallet creation, existing-wallet requests,
+test funding, completed transfers, insufficient-funds declines, and
+idempotent replays.
+
+HTTP request metrics include request rate, latency, and errors. Histogram
+buckets are enabled for `http.server.requests`, allowing p99 latency to be
+calculated from the Prometheus metrics.
+
+Metrics are exposed through:
+
+```text
+GET /metrics
+```
+
+Health information is exposed through:
+
+```text
+GET /health
+```
+
+## 7. Test Funding Endpoint
+
+`POST /test/wallets/{id}/fund` exists only as test infrastructure because the
+assignment's live concurrency probes require wallets with a balance while
+the assignment itself does not define a funding mechanism.
+
+The endpoint:
+
+- is disabled by default
+- requires a separate bearer token when enabled
+- uses the existing wallet row lock
+- does not modify the transfer locking or idempotency design
+- is not a production deposit or payment feature
+
+The core transfer invariants — conservation, no overdraft, and exactly-once
+processing — remain enforced by the transaction, locking, and database
+constraints described above.
+
+The endpoint uses `SELECT ... FOR UPDATE` on the target wallet so that a
+concurrent funding operation and transfer cannot cause a lost update.
 
 ## 8. Cost
 
-Free-tier hosting throughout (containerized app + managed Postgres). Expected cost for this exercise is **₹0**, assuming free-tier limits are not exceeded.
+The exercise uses free-tier hosting with a containerized application and
+managed PostgreSQL.
+
+**Expected cost: ₹0**, assuming the free-tier limits are not exceeded.

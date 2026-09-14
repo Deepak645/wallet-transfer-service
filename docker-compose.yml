@@ -21,6 +21,10 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-wallet}
       SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-wallet}
       SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-wallet}
+      # Test-only funding endpoint (see README) - disabled/tokenless unless
+      # explicitly set in the shell environment before `docker compose up`.
+      TEST_FUNDING_ENABLED: ${TEST_FUNDING_ENABLED:-false}
+      TEST_FUNDING_TOKEN: ${TEST_FUNDING_TOKEN:-}
     ports:
       - "8080:8080"
     depends_on:

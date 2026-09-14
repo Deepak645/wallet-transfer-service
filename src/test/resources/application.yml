@@ -32,3 +32,13 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+# TEST INFRASTRUCTURE ONLY. Enabled here so the test suite can exercise
+# TestFundingController/TestFundingAuthFilter. This is a fixture value for
+# the local Testcontainers test suite only - not a real secret, never used
+# against any real deployment (Railway's TEST_FUNDING_TOKEN is set as an
+# environment variable there, never in a file).
+test:
+  funding:
+    enabled: true
+    token: test-only-fixture-token-not-a-secret

@@ -9,6 +9,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.time.Instant;
 import java.util.stream.Collectors;
@@ -49,6 +50,20 @@ public class GlobalExceptionHandler {
                 .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
                 .collect(Collectors.joining("; "));
         return build(HttpStatus.BAD_REQUEST, message.isEmpty() ? "Validation failed" : message, request);
+    }
+
+    /**
+     * Spring Boot's Servlet 3.2+ behavior for any unmapped path: the
+     * built-in static-resource handler throws this instead of the classic
+     * silent 404. Without an explicit handler here it would otherwise fall
+     * through to the generic Exception handler below and become a
+     * misleading 500 - this matters concretely for the test-only
+     * /test/wallets/{id}/fund endpoint, which is conditionally registered
+     * and must 404 cleanly when disabled (see TestFundingController).
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiError> handleNoResourceFound(NoResourceFoundException ex, HttpServletRequest request) {
+        return build(HttpStatus.NOT_FOUND, "No endpoint " + request.getMethod() + " " + request.getRequestURI(), request);
     }
 
     @ExceptionHandler(Exception.class)

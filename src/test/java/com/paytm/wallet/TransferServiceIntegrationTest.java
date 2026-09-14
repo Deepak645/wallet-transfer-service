@@ -312,15 +312,31 @@ class TransferServiceIntegrationTest {
     }
 
     @Test
-    void declinedTransfer_incrementsDeclinedCounter() {
+    void declinedTransfer_incrementsDeclinedInsufficientFundsCounter() {
         Wallet a = fundedWallet(100);
         Wallet b = fundedWallet(0);
-        double before = counterValue("transfers.declined");
+        double before = counterValue("transfers.declined_insufficient_funds");
 
         transferService.createTransfer("caller",
                 new CreateTransferRequest(a.id(), b.id(), 500, "key-" + UUID.randomUUID()));
 
-        assertThat(counterValue("transfers.declined")).isEqualTo(before + 1);
+        assertThat(counterValue("transfers.declined_insufficient_funds")).isEqualTo(before + 1);
+    }
+
+    @Test
+    void createTransfer_incrementsCreateCounterRegardlessOfOutcome() {
+        Wallet a = fundedWallet(10_000);
+        Wallet b = fundedWallet(0);
+        double before = counterValue("transfers.create");
+
+        // One completes, one declines - "create" counts every genuine new
+        // transfer attempt, not just successful movements.
+        transferService.createTransfer("caller",
+                new CreateTransferRequest(a.id(), b.id(), 1_000, "key-" + UUID.randomUUID()));
+        transferService.createTransfer("caller",
+                new CreateTransferRequest(a.id(), b.id(), 999_999, "key-" + UUID.randomUUID()));
+
+        assertThat(counterValue("transfers.create")).isEqualTo(before + 2);
     }
 
     @Test
@@ -355,6 +371,12 @@ class TransferServiceIntegrationTest {
             transferService.createTransfer("caller",
                     new CreateTransferRequest(c.id(), b.id(), 500, "key-" + UUID.randomUUID())); // declined
 
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer created".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.created"));
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer debited".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.debited"));
+            assertThat(appender.list).anyMatch(e ->
+                    "transfer credited".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.credited"));
             assertThat(appender.list).anyMatch(e ->
                     "transfer completed".equals(e.getFormattedMessage()) && hasKv(e, "event", "transfer.completed"));
             assertThat(appender.list).anyMatch(e ->
